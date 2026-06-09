@@ -43,17 +43,6 @@ streamlit run app.py
 - Output sheet එකේ **mark කරපු sheets පමණයි** (unmarked sheets include වෙන්නේ නැහැ).
 - හැම output cell එකක්ම TEXT (`@`) format — Excel එකේ අයෙත් number/date විදිහට auto-convert වෙන්නේ නැහැ.
 
-## 🧾 System / Physical sheet split (update)
-
-Marked sheet එකකට output එකේ **sheet දෙකක්** හැදෙනවා:
-
-| Output sheet | අන්තර්ගතය | තැන |
-|--------------|-----------|-----|
-| `System <name>` | process + scale (×100/1000) + clean + TEXT | original sheet තිබුණ **position** එකේම |
-| `Physical <name>` | original sheet එක **එහෙම්ම** (as-is, scale/clean නැතුව) | workbook එකේ **අන්තිමට** |
-
-Unmarked sheets (include කරොත්) clean-only, ඒවාගේ original නම් + position එකේම.
-
 ## 🔄 Multi-user / Speed / Online count (update)
 
 - **Multi-user:** Streamlit session එකක් = එක user — state වෙන වෙනම. එකම වෙලාවට කිහිප දෙනෙක්ට පාවිච්චි කරන්න පුළුවන්.
