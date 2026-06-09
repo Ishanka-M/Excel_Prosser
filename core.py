@@ -143,16 +143,41 @@ def process_sheet(rows, multiplier, scale=True):
     return cleaned, header_idx, target_cols, warnings, scaled_count, bool(target_cols)
 
 
-def build_workbook(processed_sheets):
-    """processed_sheets: dict[sheet_name] = cleaned_grid -> xlsx bytes (all cells TEXT)."""
+def safe_title(title, used):
+    """Excel sheet-name (max 31, invalid chars, unique) safe කරනවා."""
+    for ch in '[]:*?/\\':
+        title = title.replace(ch, " ")
+    title = re.sub(r"\s+", " ", title).strip()[:31] or "Sheet"
+    base = title
+    i = 2
+    while title.lower() in used:
+        suffix = f" ({i})"
+        title = base[:31 - len(suffix)] + suffix
+        i += 1
+    used.add(title.lower())
+    return title
+
+
+def build_workbook(entries):
+    """entries: ordered list of dicts -> xlsx bytes.
+
+    each entry: {"title": str, "grid": 2D list, "as_text": bool}
+      as_text=True  -> හැම cell එකක්ම TEXT ('@') format (System / clean sheets)
+      as_text=False -> values as-is, format override නැහැ (Physical / original sheets)
+    """
     wb = Workbook()
     wb.remove(wb.active)
-    for sheet_name, grid in processed_sheets.items():
-        ws = wb.create_sheet(title=sheet_name[:31])  # Excel sheet name limit 31
-        for r, row in enumerate(grid, start=1):
+    used = set()
+    for e in entries:
+        ws = wb.create_sheet(title=safe_title(e["title"], used))
+        as_text = e.get("as_text", True)
+        for r, row in enumerate(e["grid"], start=1):
             for c, val in enumerate(row, start=1):
                 cell = ws.cell(row=r, column=c, value=val)
-                cell.number_format = "@"  # TEXT format
+                if as_text:
+                    cell.number_format = "@"  # TEXT format
+    if not wb.sheetnames:           # හිස් වුණොත් (defensive)
+        wb.create_sheet(title="Sheet1")
     bio = io.BytesIO()
     wb.save(bio)
     bio.seek(0)

@@ -21,7 +21,34 @@ from openpyxl import load_workbook
 
 from core import process_sheet, build_workbook
 
-st.set_page_config(page_title="Excel Cleaner & Qty Scaler", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Excel Cleaner & Qty Scaler", page_icon="📊", layout="centered")
+
+CSS = """
+<style>
+.block-container {max-width: 920px; padding-top: 1.4rem; padding-bottom: 3rem;}
+#MainMenu, footer {visibility: hidden;}
+.app-header{
+  background:linear-gradient(135deg,#4f46e5 0%,#0ea5e9 100%);
+  padding:20px 24px;border-radius:16px;margin-bottom:18px;
+  box-shadow:0 6px 24px rgba(79,70,229,.25);
+}
+.app-header h1{color:#fff;font-size:1.45rem;font-weight:700;margin:0;letter-spacing:.2px;}
+.app-header p{color:#e0e7ff;font-size:.86rem;margin:.3rem 0 0;}
+.step-label{font-size:.78rem;font-weight:700;letter-spacing:.6px;
+  text-transform:uppercase;color:#6366f1;margin:.2rem 0 .5rem;}
+[data-testid="stMetric"]{
+  background:rgba(125,125,125,.07);border:1px solid rgba(125,125,125,.16);
+  border-radius:14px;padding:12px 16px;
+}
+[data-testid="stMetricValue"]{font-size:1.5rem;font-weight:700;}
+[data-testid="stMetricLabel"]{opacity:.7;font-size:.78rem;}
+.stButton>button,.stDownloadButton>button{border-radius:10px;font-weight:600;}
+.stDownloadButton>button{width:100%;padding:.55rem;}
+section[data-testid="stSidebar"] [data-testid="stMetric"]{text-align:center;}
+hr{margin:1rem 0;}
+</style>
+"""
+st.markdown(CSS, unsafe_allow_html=True)
 
 PRESENCE_WINDOW = 20  # තත්පර — මේ ඇතුළත heartbeat ආපු session = online
 
@@ -65,11 +92,17 @@ def read_sheet_names(file_bytes: bytes):
 
 @st.cache_data(show_spinner=False, max_entries=30)
 def run_processing(file_bytes: bytes, selected: tuple, multiplier: int, include_unmarked: bool):
-    """සම්පූර්ණ processing — bytes+params එකම නම් cache එකෙන් instant (multi-user share)."""
+    """සම්පූර්ණ processing — bytes+params එකම නම් cache එකෙන් instant (multi-user share).
+
+    Marked sheet එකකට output එකේ:
+      - "System <name>"   : process/scale කරපු එක, original position එකේ (TEXT)
+      - "Physical <name>" : original sheet එක එහෙම්ම (as-is), workbook අන්තිමට
+    """
     wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
     selected_set = set(selected)
 
-    processed = {}      # ordered: original sheet order
+    entries = []            # ordered — System / unmarked sheets (original positions)
+    physical_entries = []   # Physical (original) sheets — අන්තිමට
     summary = []
     warnings = []
 
@@ -82,137 +115,168 @@ def run_processing(file_bytes: bytes, selected: tuple, multiplier: int, include_
         grid, header_idx, target_cols, w, scaled, found = process_sheet(
             rows, multiplier, scale=is_marked
         )
-        processed[name] = grid
-        for x in w:
-            x["sheet"] = name
-        warnings.extend(w)
 
-        if not is_marked:
-            qty_status = "— (clean-only)"
-        elif not found:
-            qty_status = "⚠️ Qty header හමු වුණේ නැහැ"
+        if is_marked:
+            # System sheet (scaled, text) — original position එකේ
+            entries.append({"title": f"System {name}", "grid": grid, "as_text": True})
+            # Physical sheet (original values as-is) — අන්තිමට
+            physical_entries.append({
+                "title": f"Physical {name}",
+                "grid": [list(r) for r in rows],
+                "as_text": False,
+            })
+            for x in w:
+                x["sheet"] = name
+            warnings.extend(w)
+            qty_status = ("✅ " + ", ".join(target_cols.values())) if found else "⚠️ Not found"
+            summary.append({
+                "Sheet": name,
+                "Qty column": qty_status,
+                "Scaled": scaled,
+                "⚠": len(w),
+            })
         else:
-            qty_status = "✅ " + ", ".join(target_cols.values())
-
-        summary.append({
-            "Sheet": name,
-            "Mode": "Scaled" if is_marked else "Clean-only",
-            "Rows": len(rows),
-            "Qty column": qty_status,
-            "Scaled cells": scaled,
-            "Warnings": len(w),
-        })
+            # unmarked + include -> clean-only, original position, same name
+            entries.append({"title": name, "grid": grid, "as_text": True})
+            summary.append({
+                "Sheet": name, "Qty column": "— clean-only", "Scaled": 0, "⚠": 0,
+            })
 
     wb.close()
-    out_bytes = build_workbook(processed)
-    total_scaled = sum(r["Scaled cells"] for r in summary)
-    return summary, warnings, out_bytes, total_scaled
+    entries.extend(physical_entries)        # Physical sheets අන්තිමට
+    out_bytes = build_workbook(entries)
+    total_scaled = sum(r["Scaled"] for r in summary)
+    out_order = [e["title"] for e in entries]
+    return summary, warnings, out_bytes, total_scaled, out_order
 
 
 # ----------------------------- Sidebar -----------------------------
 
 with st.sidebar:
-    st.header("ℹ️ Status")
+    st.markdown("### ⚙️ Status")
     online_badge()
     st.divider()
+    st.markdown("**How it works**")
     st.caption(
-        "හැම user session එකකම වෙන වෙනම state — එකම වෙලාවට කිහිප දෙනෙක්ට පාවිච්චි කරන්න පුළුවන්.\n\n"
-        "එකම file + settings නැවත process කරාම cache එකෙන් instant."
+        "1. Excel upload කරන්න\n\n"
+        "2. Process කරන sheets mark කරන්න\n\n"
+        "3. Multiplier (×100 / ×1000) තෝරන්න\n\n"
+        "4. Clean Excel download කරන්න"
+    )
+    st.divider()
+    st.caption(
+        "Marked sheet එකකට **System** (scaled) + **Physical** (original) "
+        "sheet දෙකක් හැදෙනවා.\n\nMulti-user ready · cached for speed."
     )
 
 
 # ----------------------------- Main -----------------------------
 
-st.title("📊 Excel Cleaner & Quantity Scaler")
-st.caption("Excel upload → sheets mark → clean + QUANTITY/Actual Qty scale → download.")
+st.markdown(
+    '<div class="app-header"><h1>📊 Excel Cleaner &amp; Quantity Scaler</h1>'
+    '<p>Upload → mark sheets → clean &amp; scale QUANTITY / Actual Qty → download</p></div>',
+    unsafe_allow_html=True,
+)
 
-uploaded = st.file_uploader("Excel file එක upload කරන්න (.xlsx / .xlsm)", type=["xlsx", "xlsm"])
+# ---- Step 1: Upload ----
+with st.container(border=True):
+    st.markdown('<div class="step-label">Step 1 · Upload</div>', unsafe_allow_html=True)
+    uploaded = st.file_uploader(
+        "Excel file (.xlsx / .xlsm)", type=["xlsx", "xlsm"], label_visibility="collapsed"
+    )
 
 if uploaded is None:
     st.info("පටන් ගන්න Excel file එකක් upload කරන්න.")
     st.stop()
 
 file_bytes = uploaded.getvalue()
-
 try:
     sheet_names = read_sheet_names(file_bytes)
 except Exception as e:
     st.error(f"File එක කියවන්න බැරි වුණා: {e}")
     st.stop()
 
-st.subheader("1️⃣ Sheets mark කරන්න")
-mc1, mc2 = st.columns([3, 1])
-with mc2:
-    if st.button("✅ Select all"):
-        for i in range(len(sheet_names)):
-            st.session_state[f"sheet_{i}"] = True
-    if st.button("✖️ Clear all"):
-        for i in range(len(sheet_names)):
-            st.session_state[f"sheet_{i}"] = False
+# ---- Step 2: Sheets ----
+with st.container(border=True):
+    h1, h2 = st.columns([3, 1.4])
+    with h1:
+        st.markdown('<div class="step-label">Step 2 · Select sheets</div>', unsafe_allow_html=True)
+    with h2:
+        b1, b2 = st.columns(2)
+        if b1.button("All", use_container_width=True):
+            for i in range(len(sheet_names)):
+                st.session_state[f"sheet_{i}"] = True
+        if b2.button("Clear", use_container_width=True):
+            for i in range(len(sheet_names)):
+                st.session_state[f"sheet_{i}"] = False
 
-selected = []
-cols = st.columns(min(3, len(sheet_names)) or 1)
-for idx, name in enumerate(sheet_names):
-    with cols[idx % len(cols)]:
-        if st.checkbox(name, key=f"sheet_{idx}"):
-            selected.append(name)
+    selected = []
+    cols = st.columns(min(3, len(sheet_names)) or 1)
+    for idx, name in enumerate(sheet_names):
+        with cols[idx % len(cols)]:
+            if st.checkbox(name, key=f"sheet_{idx}"):
+                selected.append(name)
 
-st.subheader("2️⃣ Settings")
-sc1, sc2 = st.columns(2)
-with sc1:
-    multiplier = st.radio(
-        "QUANTITY / Actual Qty value එක මෙයින් වැඩි කරනවා:",
-        options=[100, 1000], horizontal=True,
-    )
-with sc2:
-    include_unmarked = st.checkbox(
-        "Unmarked sheets ද output එකට include කරන්න (clean-only, scale කරන්නේ නැහැ)",
-        value=False,
-    )
+# ---- Step 3: Settings ----
+with st.container(border=True):
+    st.markdown('<div class="step-label">Step 3 · Settings</div>', unsafe_allow_html=True)
+    sc1, sc2 = st.columns([1, 1.6])
+    with sc1:
+        multiplier = st.radio("Multiply QTY by", options=[100, 1000], horizontal=True)
+    with sc2:
+        include_unmarked = st.checkbox(
+            "Unmarked sheets ද include කරන්න (clean-only)", value=False
+        )
 
-st.divider()
-run = st.button("▶️ Process කරන්න", type="primary", disabled=not selected)
-
+run = st.button("▶️  Process & generate", type="primary", use_container_width=True, disabled=not selected)
 if not selected:
-    st.warning("අඩුම තරමේ එක sheet එකක්වත් mark කරන්න.")
+    st.caption("අඩුම තරමේ එක sheet එකක්වත් mark කරන්න.")
 
+# ---- Results ----
 if run and selected:
     with st.spinner("Processing..."):
-        summary, all_warnings, out_bytes, total_scaled = run_processing(
+        summary, all_warnings, out_bytes, total_scaled, out_order = run_processing(
             file_bytes, tuple(sorted(selected)), multiplier, include_unmarked
         )
 
-    st.subheader("3️⃣ Summary")
-    st.dataframe(summary, use_container_width=True, hide_index=True)
+    with st.container(border=True):
+        st.markdown('<div class="step-label">Result</div>', unsafe_allow_html=True)
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Sheets in output", len(summary))
-    c2.metric(f"Cells scaled (×{multiplier})", total_scaled)
-    c3.metric("Warnings", len(all_warnings))
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Output sheets", len(out_order))
+        m2.metric(f"Cells scaled ×{multiplier}", total_scaled)
+        m3.metric("Warnings", len(all_warnings))
 
-    if all_warnings:
-        st.subheader("⚠️ Warnings — decimal / digit issues")
-        st.caption(
-            "මේ value scale කරාට පස්සේ decimal විදිහට, නැත්නම් digit 3ට වඩා වැඩි නැහැ. "
-            "Multiplier (100/1000) හරිද බලන්න."
-        )
         st.dataframe(
-            [{
-                "Sheet": w["sheet"], "Cell": w["cell"], "Header": w["header"],
-                "Original": w["original"], f"Scaled (×{multiplier})": w["scaled"],
-                "Issue": w["issue"],
-            } for w in all_warnings],
-            use_container_width=True, hide_index=True,
+            summary, use_container_width=True, hide_index=True,
+            column_config={
+                "Sheet": st.column_config.TextColumn(width="medium"),
+                "Qty column": st.column_config.TextColumn(width="medium"),
+                "Scaled": st.column_config.NumberColumn(width="small"),
+                "⚠": st.column_config.NumberColumn(width="small"),
+            },
         )
-    else:
-        st.success("Warnings නැහැ — හැම scaled value එකක්ම integer + digit 3ට වඩා වැඩියි. 👍")
 
-    st.subheader("4️⃣ Download")
-    base = uploaded.name.rsplit(".", 1)[0]
-    st.download_button(
-        "⬇️ Clean Excel download කරන්න",
-        data=out_bytes,
-        file_name=f"{base}_cleaned.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-    st.caption("Output එකේ හැම cell එකක්ම TEXT format ('@'). Marked sheets scale වෙනවා, unmarked clean-only.")
+        base = uploaded.name.rsplit(".", 1)[0]
+        st.download_button(
+            "⬇️  Download cleaned Excel",
+            data=out_bytes,
+            file_name=f"{base}_cleaned.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+        )
+
+        with st.expander(f"Output sheet order  ·  {len(out_order)} sheets"):
+            st.write("  →  ".join(out_order))
+
+        if all_warnings:
+            with st.expander(f"⚠️  Warnings ({len(all_warnings)})", expanded=False):
+                st.caption("Scaled value එක decimal, නැත්නම් digit 3ට වඩා වැඩි නැහැ.")
+                st.dataframe(
+                    [{
+                        "Sheet": w["sheet"], "Cell": w["cell"], "Header": w["header"],
+                        "Original": w["original"], f"×{multiplier}": w["scaled"],
+                        "Issue": w["issue"],
+                    } for w in all_warnings],
+                    use_container_width=True, hide_index=True,
+                )
