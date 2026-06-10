@@ -13,6 +13,7 @@ from datetime import datetime, date, time as _time
 import streamlit as st
 from openpyxl import load_workbook, Workbook
 from openpyxl.utils import get_column_letter
+from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
 
 # ===================== CORE LOGIC (inlined) =====================
 TARGET_HEADERS = {"QUANTITY", "ACTUAL QTY"}
@@ -245,6 +246,82 @@ def copy_sheet_exact(dst, src):
     _copy_dims_merges(dst, src)
 
 
+# professional table theme
+_HDR_FILL = PatternFill("solid", fgColor="1F4E78")
+_HDR_FONT = Font(bold=True, color="FFFFFF", size=11)
+_BAND_FILL = PatternFill("solid", fgColor="EEF3FA")
+_THIN = Side(style="thin", color="D9D9D9")
+_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+_AL_CENTER = Alignment(horizontal="center", vertical="center")
+_AL_LEFT = Alignment(horizontal="left", vertical="center")
+_AL_RIGHT = Alignment(horizontal="right", vertical="center")
+
+
+def build_physical_pro(dst, src):
+    """Physical sheet — original values + number_format තියාගෙන, professional table styling.
+
+    styled header + borders + banded rows + auto width + freeze + autofilter.
+    """
+    rows = list(src.iter_rows())
+    cells_with_val = [c for row in rows for c in row if c.value is not None]
+    if not cells_with_val:
+        copy_sheet_exact(dst, src)
+        return
+
+    max_col = max(c.column for c in cells_with_val)
+    last_row = max(c.row for c in cells_with_val)
+
+    # header row = මුල් dense row එක (>=3 non-empty), නැත්නම් මුල් non-empty row
+    header_row, first_nonempty = None, None
+    for r_idx, row in enumerate(rows, start=1):
+        ne = sum(1 for c in row if c.value not in (None, ""))
+        if ne and first_nonempty is None:
+            first_nonempty = r_idx
+        if ne >= 3:
+            header_row = r_idx
+            break
+    header_row = header_row or first_nonempty or 1
+
+    # 1) values + number_format + width tracking
+    col_w = {}
+    for cell in cells_with_val:
+        nc = dst.cell(row=cell.row, column=cell.column, value=cell.value)
+        nc.number_format = cell.number_format
+        txt = faithful_text(cell.value, cell.number_format)
+        if txt:
+            col_w[cell.column] = max(col_w.get(cell.column, 0), len(txt))
+
+    # 2) style the table rectangle [header_row..last_row] x [1..max_col]
+    for r in range(header_row, last_row + 1):
+        for c in range(1, max_col + 1):
+            nc = dst.cell(row=r, column=c)
+            nc.border = _BORDER
+            if r == header_row:
+                nc.fill = _HDR_FILL
+                nc.font = _HDR_FONT
+                nc.alignment = _AL_CENTER
+            else:
+                if (r - header_row) % 2 == 0:
+                    nc.fill = _BAND_FILL
+                nc.alignment = _AL_RIGHT if to_number(nc.value) is not None else _AL_LEFT
+
+    # 3) widths / heights
+    for col, ln in col_w.items():
+        dst.column_dimensions[get_column_letter(col)].width = min(max(10, ln + 2), 45)
+    dst.row_dimensions[header_row].height = 20
+
+    # 4) freeze + autofilter
+    dst.freeze_panes = dst.cell(row=header_row + 1, column=1)
+    dst.auto_filter.ref = f"A{header_row}:{get_column_letter(max_col)}{last_row}"
+
+    # 5) merges (title rows etc.)
+    for mc in src.merged_cells.ranges:
+        try:
+            dst.merge_cells(str(mc))
+        except Exception:
+            pass
+
+
 def fill_text_sheet(dst, src, multiplier, name, scale):
     """System / copied sheet: හැම cell එකක්ම faithful TEXT; scale නම් qty columns scale."""
     rows = list(src.iter_rows())
@@ -322,7 +399,7 @@ def build_output(file_bytes, selected, multiplier, include_unmarked):
 
     for ws, name in physical_specs:
         ph_ws = out.create_sheet(title=safe_title(f"Physical {name}", used))
-        copy_sheet_exact(ph_ws, ws)
+        build_physical_pro(ph_ws, ws)
 
     src.close()
     if not out.sheetnames:
