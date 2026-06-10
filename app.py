@@ -19,7 +19,7 @@ import threading
 import streamlit as st
 from openpyxl import load_workbook
 
-from core import process_sheet, build_workbook
+from core import build_output
 
 st.set_page_config(page_title="Excel Cleaner & Qty Scaler", page_icon="📊", layout="centered")
 
@@ -92,62 +92,13 @@ def read_sheet_names(file_bytes: bytes):
 
 @st.cache_data(show_spinner=False, max_entries=30)
 def run_processing(file_bytes: bytes, selected: tuple, multiplier: int, include_unmarked: bool):
-    """සම්පූර්ණ processing — bytes+params එකම නම් cache එකෙන් instant (multi-user share).
+    """Cached wrapper — එකම file+settings නැවත දාම instant (multi-user share).
 
     Marked sheet එකකට output එකේ:
-      - "System <name>"   : process/scale කරපු එක, original position එකේ (TEXT)
-      - "Physical <name>" : original sheet එක එහෙම්ම (as-is), workbook අන්තිමට
+      - "System <name>"   : faithful TEXT + QUANTITY/Actual Qty scale, original position
+      - "Physical <name>" : original sheet එක verbatim (value+format+style), workbook අන්තිමට
     """
-    wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
-    selected_set = set(selected)
-
-    entries = []            # ordered — System / unmarked sheets (original positions)
-    physical_entries = []   # Physical (original) sheets — අන්තිමට
-    summary = []
-    warnings = []
-
-    for name in wb.sheetnames:
-        is_marked = name in selected_set
-        if not is_marked and not include_unmarked:
-            continue
-        ws = wb[name]
-        rows = list(ws.iter_rows(values_only=True))
-        grid, header_idx, target_cols, w, scaled, found = process_sheet(
-            rows, multiplier, scale=is_marked
-        )
-
-        if is_marked:
-            # System sheet (scaled, text) — original position එකේ
-            entries.append({"title": f"System {name}", "grid": grid, "as_text": True})
-            # Physical sheet (original values as-is) — අන්තිමට
-            physical_entries.append({
-                "title": f"Physical {name}",
-                "grid": [list(r) for r in rows],
-                "as_text": False,
-            })
-            for x in w:
-                x["sheet"] = name
-            warnings.extend(w)
-            qty_status = ("✅ " + ", ".join(target_cols.values())) if found else "⚠️ Not found"
-            summary.append({
-                "Sheet": name,
-                "Qty column": qty_status,
-                "Scaled": scaled,
-                "⚠": len(w),
-            })
-        else:
-            # unmarked + include -> clean-only, original position, same name
-            entries.append({"title": name, "grid": grid, "as_text": True})
-            summary.append({
-                "Sheet": name, "Qty column": "— clean-only", "Scaled": 0, "⚠": 0,
-            })
-
-    wb.close()
-    entries.extend(physical_entries)        # Physical sheets අන්තිමට
-    out_bytes = build_workbook(entries)
-    total_scaled = sum(r["Scaled"] for r in summary)
-    out_order = [e["title"] for e in entries]
-    return summary, warnings, out_bytes, total_scaled, out_order
+    return build_output(file_bytes, selected, multiplier, include_unmarked)
 
 
 # ----------------------------- Sidebar -----------------------------

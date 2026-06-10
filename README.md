@@ -43,16 +43,24 @@ streamlit run app.py
 - Output sheet එකේ **mark කරපු sheets පමණයි** (unmarked sheets include වෙන්නේ නැහැ).
 - හැම output cell එකක්ම TEXT (`@`) format — Excel එකේ අයෙත් number/date විදිහට auto-convert වෙන්නේ නැහැ.
 
-## 🧾 System / Physical sheet split (update)
+## 🧾 System / Physical sheet split
 
 Marked sheet එකකට output එකේ **sheet දෙකක්** හැදෙනවා:
 
 | Output sheet | අන්තර්ගතය | තැන |
 |--------------|-----------|-----|
-| `System <name>` | process + scale (×100/1000) + clean + TEXT | original sheet තිබුණ **position** එකේම |
-| `Physical <name>` | original sheet එක **එහෙම්ම** (as-is, scale/clean නැතුව) | workbook එකේ **අන්තිමට** |
+| `System <name>` | හැම cell එකක්ම **TEXT** (`@`) — displayed value එකම (dates number_format respect, leading zeros, decimals, spaces එහෙම්ම); QUANTITY/Actual Qty `×100/1000` | original position |
+| `Physical <name>` | original sheet එක **verbatim** (value + format + style) | workbook අන්තිමට |
 
-Unmarked sheets (include කරොත්) clean-only, ඒවාගේ original නම් + position එකේම.
+### Value/format faithful (text conversion)
+
+හැම cell එකක්ම text වුණත් **displayed value එක වෙනස් වෙන්නේ නැහැ**:
+
+- **Date:** `4/20/2026` (m/d/yyyy) → text `4/20/2026` (ISO `2026-04-20T...` වෙන්නේ නැහැ). number_format token (m/d/yyyy, dd-mmm-yyyy, h:mm AM/PM ...) respect කරනවා.
+- Leading zeros (`0003983473`), `0.000` decimals (`0.092`), internal spaces — එහෙම්ම
+- Hidden / zero-width / control chars විතරක් අයින් (visible value නොවෙනස්ව)
+- QUANTITY / Actual Qty විතරක් `× multiplier`; අනික් data වලට අලුතෙන් මොකුත් add වෙන්නේ නැහැ
+
 
 ## 🔄 Multi-user / Speed / Online count (update)
 
