@@ -33,9 +33,10 @@ streamlit run app.py
 
 | File | Description |
 |------|-------------|
-| `app.py` | Streamlit UI layer |
-| `core.py` | Cleaning + scaling logic (UI-independent, testable) |
+| `app.py` | **Single self-contained app** (UI + logic, no other modules needed) |
 | `requirements.txt` | Dependencies |
+
+> ⚠️ Deploy කරද්දී **`app.py` + `requirements.txt`** දෙක push කරන්න ඕනේ. `core.py` දැන් අවශ්‍ය නැහැ (සියල්ල `app.py` ඇතුළේ).
 
 ## ⚙️ Notes
 
