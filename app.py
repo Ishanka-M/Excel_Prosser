@@ -260,7 +260,7 @@ def fill_text_sheet(dst, src, multiplier, name, scale):
     warnings, scaled = [], 0
     for i, row in enumerate(rows):
         for cell in row:
-            is_qty = (scale and header_idx is not None
+            is_qty = (scale and multiplier is not None and header_idx is not None
                       and cell.column in target_cols and i > header_idx)
             if is_qty and to_number(cell.value) is not None:
                 num = to_number(cell.value)
@@ -488,7 +488,9 @@ with st.container(border=True):
     st.markdown('<div class="step-label">Step 3 · Settings</div>', unsafe_allow_html=True)
     sc1, sc2 = st.columns([1, 1.6])
     with sc1:
-        multiplier = st.radio("Multiply QTY by", options=[100, 1000], horizontal=True)
+        mult_choice = st.radio("Multiply QTY by", options=["None", 100, 1000],
+                               horizontal=True, index=1)
+        multiplier = None if mult_choice == "None" else mult_choice
     with sc2:
         include_unmarked = st.checkbox(
             "Unmarked sheets ද include කරන්න (clean-only)", value=False
@@ -510,7 +512,7 @@ if run and selected:
 
         m1, m2, m3 = st.columns(3)
         m1.metric("Output sheets", len(out_order))
-        m2.metric(f"Cells scaled ×{multiplier}", total_scaled)
+        m2.metric("Cells scaled" + (f" ×{multiplier}" if multiplier else " (none)"), total_scaled)
         m3.metric("Warnings", len(all_warnings))
 
         st.dataframe(
