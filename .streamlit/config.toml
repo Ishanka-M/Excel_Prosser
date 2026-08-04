@@ -1,0 +1,19 @@
+# .streamlit/config.toml  — app root එකේ .streamlit folder එකක් හදලා මේක දාන්න
+
+[server]
+maxUploadSize = 50          # MB — මීට වඩා ලොකු file එකක් upload වෙලා OOM වෙන එක නවතී
+maxMessageSize = 200        # websocket message cap (MB)
+enableWebsocketCompression = true
+enableXsrfProtection = true
+enableCORS = false
+headless = true
+fileWatcherType = "none"    # production එකේ file watcher එක අනවශ්‍ය CPU කනවා
+
+[browser]
+gatherUsageStats = false
+
+[client]
+showErrorDetails = true     # error එකක් ආවොත් screen එකේ පේනවා (silent death නෑ)
+
+[runner]
+fastReruns = true
