@@ -2,20 +2,23 @@
 Excel Cleaner & Quantity Scaler — single-file Streamlit app (self-contained).
 Run:  python -m streamlit run app.py
 
-STABILITY UPDATE (logic 100% same):
+STABILITY UPDATE v2 (logic 100% same — output Excel එක නොවෙනස්):
+  * Output workbook එක RAM එකේ cache වෙන්නේ නෑ — disk temp file එකකට save (OOM #1 හේතුව)
   * Cache keys = file digest (MB ගණන් bytes හැම rerun එකකම hash වෙන එක නවතී)
-  * Cache max_entries කුඩා + TTL → memory blow-up / OOM restart නවතී
   * Workbook close + gc.collect() → RAM ආපහු release
+  * st.fragment / st.container(border) version-safe → පරණ Streamlit එකකත් "Oh no" නෑ
   * Processing try/except → error එකකින් app crash වෙන්නේ නෑ
-  * Result session_state එකේ → download click කරාම reprocess වෙන්නේ නෑ
   * Presence registry capped + heartbeat 5s → 10s (websocket load අඩුයි)
 """
 import io
+import os
 import re
 import gc
 import time
 import uuid
+import atexit
 import hashlib
+import tempfile
 import threading
 from copy import copy
 from datetime import datetime, date, time as _time
@@ -385,7 +388,7 @@ def fill_text_sheet(dst, src, multiplier, name, scale):
 
 # --------------------------- orchestration ---------------------------
 
-def build_output(file_bytes, selected, multiplier, include_unmarked):
+def build_output(file_bytes, selected, multiplier, include_unmarked, out_path):
     src = load_workbook(io.BytesIO(file_bytes), data_only=True, keep_links=False)
     out = Workbook()
     try:
@@ -421,14 +424,11 @@ def build_output(file_bytes, selected, multiplier, include_unmarked):
 
         if not out.sheetnames:
             out.create_sheet(title="Sheet1")
-        bio = io.BytesIO()
-        out.save(bio)
-        bio.seek(0)
+        # RAM එකට bytes ගන්නේ නෑ — කෙලින්ම disk එකට save (memory spike එක අඩකින් අඩුයි)
+        out.save(out_path)
         total_scaled = sum(r["Scaled"] for r in summary)
         sheet_order = list(out.sheetnames)
-        data = bio.getvalue()
-        bio.close()
-        return summary, warnings, data, total_scaled, sheet_order
+        return summary, warnings, out_path, total_scaled, sheet_order
     finally:
         # RAM release — මේක නැත්නම් file කීපයකින් පස්සේ process එක OOM වෙලා down වෙනවා
         try:
@@ -508,13 +508,30 @@ def heartbeat_and_count(window=PRESENCE_WINDOW):
         return 1
 
 
-@st.fragment(run_every=PRESENCE_BEAT)
-def online_badge():
+def _online_badge_impl():
     """තත්පර 10කට වරක් rerun වෙලා heartbeat update + count පෙන්නනවා (app එක rerun නොකර)."""
     try:
         st.metric("🟢 Online users", heartbeat_and_count())
     except Exception:
         st.metric("🟢 Online users", "—")
+
+
+# Version-safe: පරණ Streamlit එකක st.fragment නැති නිසා import-time එකේම
+# AttributeError → "Oh no. Error running app" වෙනවා. දැන් fallback එකක් තියෙනවා.
+if hasattr(st, "fragment"):
+    online_badge = st.fragment(run_every=PRESENCE_BEAT)(_online_badge_impl)
+elif hasattr(st, "experimental_fragment"):
+    online_badge = st.experimental_fragment(run_every=PRESENCE_BEAT)(_online_badge_impl)
+else:
+    online_badge = _online_badge_impl
+
+
+def box():
+    """st.container(border=...) පරණ version වල නෑ — safe wrapper."""
+    try:
+        return st.container(border=True)
+    except TypeError:
+        return st.container()
 
 
 # ----------------------- Cached heavy work (speed + shared across users) -----------------------
@@ -534,16 +551,39 @@ def read_sheet_names(digest: str, _file_bytes: bytes):
         gc.collect()
 
 
-@st.cache_data(show_spinner=False, max_entries=2, ttl=CACHE_TTL)
-def run_processing(digest: str, _file_bytes: bytes, selected: tuple,
+_TMP_DIR = os.path.join(tempfile.gettempdir(), "xl_cleaner")
+os.makedirs(_TMP_DIR, exist_ok=True)
+
+
+def _drop_temp(path):
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+@atexit.register
+def _cleanup_temp():
+    try:
+        for f in os.listdir(_TMP_DIR):
+            _drop_temp(os.path.join(_TMP_DIR, f))
+    except Exception:
+        pass
+
+
+def run_processing(digest: str, file_bytes: bytes, selected: tuple,
                    multiplier, include_unmarked: bool):
-    """Cached wrapper — එකම file+settings නැවත දාම instant (multi-user share).
+    """Output එක RAM එකේ cache කරන්නේ නෑ — disk temp file එකකට save කරනවා.
+
+    (කලින් version එකේ output bytes cache එකේ රැඳිලා RAM එක පිරෙනවා → container restart.)
 
     Marked sheet එකකට output එකේ:
       - "System <name>"   : faithful TEXT + QUANTITY/Actual Qty scale, original position
       - "Physical <name>" : original sheet එක verbatim (value+format+style), workbook අන්තිමට
     """
-    return build_output(_file_bytes, selected, multiplier, include_unmarked)
+    out_path = os.path.join(_TMP_DIR, f"{digest[:10]}_{uuid.uuid4().hex[:8]}.xlsx")
+    return build_output(file_bytes, selected, multiplier, include_unmarked, out_path)
 
 
 # ----------------------------- Sidebar -----------------------------
@@ -567,10 +607,15 @@ with st.sidebar:
     st.divider()
     if st.button("🧹 Clear cache / free memory", use_container_width=True):
         st.cache_data.clear()
-        st.session_state.pop("_last_result", None)
+        old = st.session_state.pop("_last_result", None)
+        if old:
+            _drop_temp(old[2])
         st.session_state.pop("_last_meta", None)
         gc.collect()
-        st.toast("Cache cleared — memory නිදහස් කළා ✅")
+        if hasattr(st, "toast"):
+            st.toast("Cache cleared — memory නිදහස් කළා ✅")
+        else:
+            st.success("Cache cleared — memory නිදහස් කළා ✅")
 
 
 # ----------------------------- Main -----------------------------
@@ -582,7 +627,7 @@ st.markdown(
 )
 
 # ---- Step 1: Upload ----
-with st.container(border=True):
+with box():
     st.markdown('<div class="step-label">Step 1 · Upload</div>', unsafe_allow_html=True)
     uploaded = st.file_uploader(
         "Excel file (.xlsx / .xlsm)", type=["xlsx", "xlsm"], label_visibility="collapsed"
@@ -598,7 +643,9 @@ size_mb = len(file_bytes) / (1024 * 1024)
 
 # අලුත් file එකක් නම් පරණ result එක අත්හරිනවා (memory එකේ රැඳෙන්නේ නෑ)
 if st.session_state.get("_last_digest") != digest:
-    st.session_state.pop("_last_result", None)
+    _old = st.session_state.pop("_last_result", None)
+    if _old:
+        _drop_temp(_old[2])
     st.session_state.pop("_last_meta", None)
     st.session_state["_last_digest"] = digest
     gc.collect()
@@ -619,7 +666,7 @@ except Exception as e:
     st.stop()
 
 # ---- Step 2: Sheets ----
-with st.container(border=True):
+with box():
     h1, h2 = st.columns([3, 1.4])
     with h1:
         st.markdown('<div class="step-label">Step 2 · Select sheets</div>', unsafe_allow_html=True)
@@ -640,7 +687,7 @@ with st.container(border=True):
                 selected.append(name)
 
 # ---- Step 3: Settings ----
-with st.container(border=True):
+with box():
     st.markdown('<div class="step-label">Step 3 · Settings</div>', unsafe_allow_html=True)
     sc1, sc2 = st.columns([1, 1.6])
     with sc1:
@@ -658,6 +705,11 @@ if not selected:
 
 # ---- Run (error එකකින් app එක crash වෙන්නේ නෑ) ----
 if run and selected:
+    _prev = st.session_state.pop("_last_result", None)
+    if _prev:
+        _drop_temp(_prev[2])
+        _prev = None
+        gc.collect()
     try:
         with st.spinner("Processing..."):
             result = run_processing(
@@ -678,11 +730,11 @@ if run and selected:
 
 # ---- Results (session_state එකේ තියෙනවා → download click කරාම නැති වෙන්නේ නෑ) ----
 if st.session_state.get("_last_result"):
-    summary, all_warnings, out_bytes, total_scaled, out_order = st.session_state["_last_result"]
+    summary, all_warnings, out_path, total_scaled, out_order = st.session_state["_last_result"]
     meta = st.session_state.get("_last_meta", {})
     res_mult = meta.get("multiplier")
 
-    with st.container(border=True):
+    with box():
         st.markdown('<div class="step-label">Result</div>', unsafe_allow_html=True)
 
         m1, m2, m3 = st.columns(3)
@@ -701,13 +753,17 @@ if st.session_state.get("_last_result"):
         )
 
         base = meta.get("name", uploaded.name).rsplit(".", 1)[0]
-        st.download_button(
-            "⬇️  Download cleaned Excel",
-            data=out_bytes,
-            file_name=f"{base}_cleaned.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-        )
+        if os.path.exists(out_path):
+            with open(out_path, "rb") as fh:
+                st.download_button(
+                    "⬇️  Download cleaned Excel",
+                    data=fh,
+                    file_name=f"{base}_cleaned.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                )
+        else:
+            st.warning("Output file එක තව නෑ (app එක restart වෙලා). ආපහු Process කරන්න.")
 
         with st.expander(f"Output sheet order  ·  {len(out_order)} sheets"):
             st.write("  →  ".join(out_order))
