@@ -1,11 +1,21 @@
 """
 Excel Cleaner & Quantity Scaler — single-file Streamlit app (self-contained).
 Run:  python -m streamlit run app.py
+
+STABILITY UPDATE (logic 100% same):
+  * Cache keys = file digest (MB ගණන් bytes හැම rerun එකකම hash වෙන එක නවතී)
+  * Cache max_entries කුඩා + TTL → memory blow-up / OOM restart නවතී
+  * Workbook close + gc.collect() → RAM ආපහු release
+  * Processing try/except → error එකකින් app crash වෙන්නේ නෑ
+  * Result session_state එකේ → download click කරාම reprocess වෙන්නේ නෑ
+  * Presence registry capped + heartbeat 5s → 10s (websocket load අඩුයි)
 """
 import io
 import re
+import gc
 import time
 import uuid
+import hashlib
 import threading
 from copy import copy
 from datetime import datetime, date, time as _time
@@ -321,6 +331,10 @@ def build_physical_pro(dst, src):
         except Exception:
             pass
 
+    # memory: loop එක ඉවර නම් references අත්හරිනවා
+    rows.clear()
+    cells_with_val.clear()
+
 
 def fill_text_sheet(dst, src, multiplier, name, scale):
     """System / copied sheet: හැම cell එකක්ම faithful TEXT; scale නම් qty columns scale."""
@@ -365,50 +379,68 @@ def fill_text_sheet(dst, src, multiplier, name, scale):
                 nc = dst.cell(row=cell.row, column=cell.column, value=txt)
                 nc.number_format = "@"
     _copy_dims_merges(dst, src)
+    rows.clear()
     return warnings, scaled, bool(target_cols), target_cols
 
 
 # --------------------------- orchestration ---------------------------
 
 def build_output(file_bytes, selected, multiplier, include_unmarked):
-    src = load_workbook(io.BytesIO(file_bytes), data_only=True)
-    selected_set = set(selected)
+    src = load_workbook(io.BytesIO(file_bytes), data_only=True, keep_links=False)
     out = Workbook()
-    out.remove(out.active)
-    used = set()
-    summary, warnings, physical_specs = [], [], []
+    try:
+        selected_set = set(selected)
+        out.remove(out.active)
+        used = set()
+        summary, warnings, physical_specs = [], [], []
 
-    for name in src.sheetnames:
-        marked = name in selected_set
-        if not marked and not include_unmarked:
-            continue
-        ws = src[name]
-        if marked:
-            sys_ws = out.create_sheet(title=safe_title(f"System {name}", used))
-            w, scaled, found, tcols = fill_text_sheet(sys_ws, ws, multiplier, name, scale=True)
-            warnings.extend(w)
-            physical_specs.append((ws, name))
-            qty_status = ("✅ " + ", ".join(tcols.values())) if found else "⚠️ Not found"
-            summary.append({"Sheet": name, "Qty column": qty_status,
-                            "Scaled": scaled, "⚠": len(w)})
-        else:
-            cl_ws = out.create_sheet(title=safe_title(name, used))
-            fill_text_sheet(cl_ws, ws, multiplier, name, scale=False)
-            summary.append({"Sheet": name, "Qty column": "— clean-only (text)",
-                            "Scaled": 0, "⚠": 0})
+        for name in src.sheetnames:
+            marked = name in selected_set
+            if not marked and not include_unmarked:
+                continue
+            ws = src[name]
+            if marked:
+                sys_ws = out.create_sheet(title=safe_title(f"System {name}", used))
+                w, scaled, found, tcols = fill_text_sheet(sys_ws, ws, multiplier, name, scale=True)
+                warnings.extend(w)
+                physical_specs.append((ws, name))
+                qty_status = ("✅ " + ", ".join(tcols.values())) if found else "⚠️ Not found"
+                summary.append({"Sheet": name, "Qty column": qty_status,
+                                "Scaled": scaled, "⚠": len(w)})
+            else:
+                cl_ws = out.create_sheet(title=safe_title(name, used))
+                fill_text_sheet(cl_ws, ws, multiplier, name, scale=False)
+                summary.append({"Sheet": name, "Qty column": "— clean-only (text)",
+                                "Scaled": 0, "⚠": 0})
 
-    for ws, name in physical_specs:
-        ph_ws = out.create_sheet(title=safe_title(f"Physical {name}", used))
-        build_physical_pro(ph_ws, ws)
+        for ws, name in physical_specs:
+            ph_ws = out.create_sheet(title=safe_title(f"Physical {name}", used))
+            build_physical_pro(ph_ws, ws)
 
-    src.close()
-    if not out.sheetnames:
-        out.create_sheet(title="Sheet1")
-    bio = io.BytesIO()
-    out.save(bio)
-    bio.seek(0)
-    total_scaled = sum(r["Scaled"] for r in summary)
-    return summary, warnings, bio.getvalue(), total_scaled, out.sheetnames
+        physical_specs.clear()
+
+        if not out.sheetnames:
+            out.create_sheet(title="Sheet1")
+        bio = io.BytesIO()
+        out.save(bio)
+        bio.seek(0)
+        total_scaled = sum(r["Scaled"] for r in summary)
+        sheet_order = list(out.sheetnames)
+        data = bio.getvalue()
+        bio.close()
+        return summary, warnings, data, total_scaled, sheet_order
+    finally:
+        # RAM release — මේක නැත්නම් file කීපයකින් පස්සේ process එක OOM වෙලා down වෙනවා
+        try:
+            src.close()
+        except Exception:
+            pass
+        try:
+            out.close()
+        except Exception:
+            pass
+        del src, out
+        gc.collect()
 
 
 # ===================== STREAMLIT APP =====================
@@ -442,7 +474,11 @@ hr{margin:1rem 0;}
 """
 st.markdown(CSS, unsafe_allow_html=True)
 
-PRESENCE_WINDOW = 20  # තත්පර — මේ ඇතුළත heartbeat ආපු session = online
+PRESENCE_WINDOW = 30      # තත්පර — මේ ඇතුළත heartbeat ආපු session = online
+PRESENCE_BEAT = 10        # heartbeat interval (5 → 10; websocket traffic අඩුයි)
+MAX_SESSIONS = 500        # registry unbounded වෙලා memory කන එක නවත්වන්න
+BIG_FILE_MB = 20          # මීට වඩා ලොකු file එකකදී warning
+CACHE_TTL = 1800          # තත්පර 30min — cache එකේ output bytes සදාකාලිකව රැඳෙන්නේ නෑ
 
 
 # ----------------------- Online presence (shared across users) -----------------------
@@ -454,43 +490,60 @@ def _presence_registry():
 
 
 def heartbeat_and_count(window=PRESENCE_WINDOW):
-    reg = _presence_registry()
-    sid = st.session_state.setdefault("_sid", str(uuid.uuid4()))
-    now = time.time()
-    with reg["lock"]:
-        reg["sessions"][sid] = now
-        stale = [k for k, v in reg["sessions"].items() if now - v > window]
-        for k in stale:
-            reg["sessions"].pop(k, None)
-        return len(reg["sessions"])
+    try:
+        reg = _presence_registry()
+        sid = st.session_state.setdefault("_sid", str(uuid.uuid4()))
+        now = time.time()
+        with reg["lock"]:
+            reg["sessions"][sid] = now
+            stale = [k for k, v in reg["sessions"].items() if now - v > window]
+            for k in stale:
+                reg["sessions"].pop(k, None)
+            # safety cap — කවදාවත් unbounded වෙන්නේ නෑ
+            if len(reg["sessions"]) > MAX_SESSIONS:
+                for k, _ in sorted(reg["sessions"].items(), key=lambda kv: kv[1])[:-MAX_SESSIONS]:
+                    reg["sessions"].pop(k, None)
+            return len(reg["sessions"])
+    except Exception:
+        return 1
 
 
-@st.fragment(run_every=5)
+@st.fragment(run_every=PRESENCE_BEAT)
 def online_badge():
-    """තත්පර 5කට වරක් rerun වෙලා heartbeat update + count පෙන්නනවා (app එක rerun නොකර)."""
-    n = heartbeat_and_count()
-    st.metric("🟢 Online users", n)
+    """තත්පර 10කට වරක් rerun වෙලා heartbeat update + count පෙන්නනවා (app එක rerun නොකර)."""
+    try:
+        st.metric("🟢 Online users", heartbeat_and_count())
+    except Exception:
+        st.metric("🟢 Online users", "—")
 
 
 # ----------------------- Cached heavy work (speed + shared across users) -----------------------
+# NOTE: cache key එකට digest එක විතරයි (bytes underscore-prefixed → hash වෙන්නේ නෑ).
+# මේකෙන් හැම rerun එකකදීම MB ගණන් bytes hash කරන CPU/RAM spike එක නවතිනවා.
 
-@st.cache_data(show_spinner=False, max_entries=30)
-def read_sheet_names(file_bytes: bytes):
-    wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
-    names = list(wb.sheetnames)
-    wb.close()
-    return names
+@st.cache_data(show_spinner=False, max_entries=3, ttl=CACHE_TTL)
+def read_sheet_names(digest: str, _file_bytes: bytes):
+    wb = load_workbook(io.BytesIO(_file_bytes), read_only=True, data_only=True, keep_links=False)
+    try:
+        return list(wb.sheetnames)
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+        gc.collect()
 
 
-@st.cache_data(show_spinner=False, max_entries=30)
-def run_processing(file_bytes: bytes, selected: tuple, multiplier: int, include_unmarked: bool):
+@st.cache_data(show_spinner=False, max_entries=2, ttl=CACHE_TTL)
+def run_processing(digest: str, _file_bytes: bytes, selected: tuple,
+                   multiplier, include_unmarked: bool):
     """Cached wrapper — එකම file+settings නැවත දාම instant (multi-user share).
 
     Marked sheet එකකට output එකේ:
       - "System <name>"   : faithful TEXT + QUANTITY/Actual Qty scale, original position
       - "Physical <name>" : original sheet එක verbatim (value+format+style), workbook අන්තිමට
     """
-    return build_output(file_bytes, selected, multiplier, include_unmarked)
+    return build_output(_file_bytes, selected, multiplier, include_unmarked)
 
 
 # ----------------------------- Sidebar -----------------------------
@@ -511,6 +564,13 @@ with st.sidebar:
         "Marked sheet එකකට **System** (scaled) + **Physical** (original) "
         "sheet දෙකක් හැදෙනවා.\n\nMulti-user ready · cached for speed."
     )
+    st.divider()
+    if st.button("🧹 Clear cache / free memory", use_container_width=True):
+        st.cache_data.clear()
+        st.session_state.pop("_last_result", None)
+        st.session_state.pop("_last_meta", None)
+        gc.collect()
+        st.toast("Cache cleared — memory නිදහස් කළා ✅")
 
 
 # ----------------------------- Main -----------------------------
@@ -533,8 +593,27 @@ if uploaded is None:
     st.stop()
 
 file_bytes = uploaded.getvalue()
+digest = hashlib.md5(file_bytes).hexdigest()          # cache key (ලාබයි, එක පාරයි)
+size_mb = len(file_bytes) / (1024 * 1024)
+
+# අලුත් file එකක් නම් පරණ result එක අත්හරිනවා (memory එකේ රැඳෙන්නේ නෑ)
+if st.session_state.get("_last_digest") != digest:
+    st.session_state.pop("_last_result", None)
+    st.session_state.pop("_last_meta", None)
+    st.session_state["_last_digest"] = digest
+    gc.collect()
+
+if size_mb > BIG_FILE_MB:
+    st.warning(
+        f"File එක {size_mb:.1f} MB — ලොකුයි. Process කරද්දී RAM ගොඩක් යනවා, "
+        "එකපාරට sheets ටිකක් විතරක් mark කරන එක safe."
+    )
+
 try:
-    sheet_names = read_sheet_names(file_bytes)
+    sheet_names = read_sheet_names(digest, file_bytes)
+except MemoryError:
+    st.error("Memory මදි වුණා — file එක ලොකු වැඩියි. Sheets බෙදලා try කරන්න.")
+    st.stop()
 except Exception as e:
     st.error(f"File එක කියවන්න බැරි වුණා: {e}")
     st.stop()
@@ -577,19 +656,38 @@ run = st.button("▶️  Process & generate", type="primary", use_container_widt
 if not selected:
     st.caption("අඩුම තරමේ එක sheet එකක්වත් mark කරන්න.")
 
-# ---- Results ----
+# ---- Run (error එකකින් app එක crash වෙන්නේ නෑ) ----
 if run and selected:
-    with st.spinner("Processing..."):
-        summary, all_warnings, out_bytes, total_scaled, out_order = run_processing(
-            file_bytes, tuple(sorted(selected)), multiplier, include_unmarked
+    try:
+        with st.spinner("Processing..."):
+            result = run_processing(
+                digest, file_bytes, tuple(sorted(selected)), multiplier, include_unmarked
+            )
+        st.session_state["_last_result"] = result
+        st.session_state["_last_meta"] = {"name": uploaded.name, "multiplier": multiplier}
+    except MemoryError:
+        st.session_state.pop("_last_result", None)
+        st.error(
+            "Memory මදි වුණා — sheets ගණන අඩු කරලා නැත්නම් file එක කොටස් වලට කඩලා try කරන්න."
         )
+    except Exception as e:
+        st.session_state.pop("_last_result", None)
+        st.error(f"Process කරද්දී error එකක්: {type(e).__name__} — {e}")
+    finally:
+        gc.collect()
+
+# ---- Results (session_state එකේ තියෙනවා → download click කරාම නැති වෙන්නේ නෑ) ----
+if st.session_state.get("_last_result"):
+    summary, all_warnings, out_bytes, total_scaled, out_order = st.session_state["_last_result"]
+    meta = st.session_state.get("_last_meta", {})
+    res_mult = meta.get("multiplier")
 
     with st.container(border=True):
         st.markdown('<div class="step-label">Result</div>', unsafe_allow_html=True)
 
         m1, m2, m3 = st.columns(3)
         m1.metric("Output sheets", len(out_order))
-        m2.metric("Cells scaled" + (f" ×{multiplier}" if multiplier else " (none)"), total_scaled)
+        m2.metric("Cells scaled" + (f" ×{res_mult}" if res_mult else " (none)"), total_scaled)
         m3.metric("Warnings", len(all_warnings))
 
         st.dataframe(
@@ -602,7 +700,7 @@ if run and selected:
             },
         )
 
-        base = uploaded.name.rsplit(".", 1)[0]
+        base = meta.get("name", uploaded.name).rsplit(".", 1)[0]
         st.download_button(
             "⬇️  Download cleaned Excel",
             data=out_bytes,
@@ -620,7 +718,7 @@ if run and selected:
                 st.dataframe(
                     [{
                         "Sheet": w["sheet"], "Cell": w["cell"], "Header": w["header"],
-                        "Original": w["original"], f"×{multiplier}": w["scaled"],
+                        "Original": w["original"], f"×{res_mult}": w["scaled"],
                         "Issue": w["issue"],
                     } for w in all_warnings],
                     use_container_width=True, hide_index=True,
