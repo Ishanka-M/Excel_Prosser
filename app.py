@@ -9,6 +9,13 @@ STABILITY UPDATE v2 (logic 100% same — output Excel එක නොවෙනස�
   * st.fragment / st.container(border) version-safe → පරණ Streamlit එකකත් "Oh no" නෑ
   * Processing try/except → error එකකින් app crash වෙන්නේ නෑ
   * Presence registry capped + heartbeat 5s → 10s (websocket load අඩුයි)
+
+v3 (UI only) — processing logic byte-for-byte same:
+  * Professional UI (masthead, numbered steps, refined metric cards)
+  * st.column_config / dataframe fallback → පරණ Streamlit එකකත් වැටෙන්නේ නෑ
+  * Temp output files auto-prune → disk පිරිලා crash වෙන්නේ නෑ
+  * Checkbox keys file එකට bind → පරණ file එකේ selection ඇදෙන්නේ නෑ
+  * Upload / result render try-except → error එකකින් page එක වැටෙන්නේ නෑ
 """
 import io
 import os
@@ -445,40 +452,103 @@ def build_output(file_bytes, selected, multiplier, include_unmarked, out_path):
 
 # ===================== STREAMLIT APP =====================
 
-st.set_page_config(page_title="Excel Cleaner & Qty Scaler", page_icon="📊", layout="centered")
+st.set_page_config(page_title="Excel Cleaner & Qty Scaler", page_icon="📊",
+                   layout="centered", initial_sidebar_state="expanded")
 
 CSS = """
 <style>
-.block-container {max-width: 920px; padding-top: 1.4rem; padding-bottom: 3rem;}
-#MainMenu, footer {visibility: hidden;}
-.app-header{
-  background:linear-gradient(135deg,#4f46e5 0%,#0ea5e9 100%);
-  padding:20px 24px;border-radius:16px;margin-bottom:18px;
-  box-shadow:0 6px 24px rgba(79,70,229,.25);
+.block-container{max-width:1000px;padding-top:1.2rem;padding-bottom:3.5rem;}
+#MainMenu, footer{visibility:hidden;}
+
+/* ---------- masthead ---------- */
+.masthead{
+  background:#0F172A;border:1px solid #1E293B;border-left:4px solid #3B82F6;
+  border-radius:12px;padding:20px 24px;margin-bottom:20px;
 }
-.app-header h1{color:#fff;font-size:1.45rem;font-weight:700;margin:0;letter-spacing:.2px;}
-.app-header p{color:#e0e7ff;font-size:.86rem;margin:.3rem 0 0;}
-.step-label{font-size:.78rem;font-weight:700;letter-spacing:.6px;
-  text-transform:uppercase;color:#6366f1;margin:.2rem 0 .5rem;}
+.masthead .kicker{
+  color:#60A5FA;font-size:.68rem;font-weight:700;letter-spacing:.16em;
+  text-transform:uppercase;margin:0 0 6px;
+}
+.masthead h1{color:#F8FAFC;font-size:1.35rem;font-weight:650;margin:0;letter-spacing:-.01em;}
+.masthead p{color:#94A3B8;font-size:.85rem;margin:.35rem 0 0;line-height:1.5;}
+
+/* ---------- step headers ---------- */
+.step{display:flex;align-items:center;gap:.6rem;margin:0 0 .85rem;}
+.step .n{
+  width:22px;height:22px;border-radius:6px;background:#3B82F6;color:#fff;
+  font-size:.72rem;font-weight:700;display:inline-flex;align-items:center;
+  justify-content:center;flex:0 0 auto;
+}
+.step .t{font-size:.76rem;font-weight:700;letter-spacing:.1em;
+  text-transform:uppercase;opacity:.75;}
+.step .hint{margin-left:auto;font-size:.74rem;opacity:.55;font-weight:500;}
+
+/* ---------- metrics ---------- */
 [data-testid="stMetric"]{
-  background:rgba(125,125,125,.07);border:1px solid rgba(125,125,125,.16);
-  border-radius:14px;padding:12px 16px;
+  background:rgba(148,163,184,.08);border:1px solid rgba(148,163,184,.2);
+  border-radius:10px;padding:12px 16px;
 }
-[data-testid="stMetricValue"]{font-size:1.5rem;font-weight:700;}
-[data-testid="stMetricLabel"]{opacity:.7;font-size:.78rem;}
-.stButton>button,.stDownloadButton>button{border-radius:10px;font-weight:600;}
-.stDownloadButton>button{width:100%;padding:.55rem;}
+[data-testid="stMetricValue"]{font-size:1.4rem;font-weight:650;letter-spacing:-.02em;}
+[data-testid="stMetricLabel"]{opacity:.65;font-size:.74rem;font-weight:600;
+  letter-spacing:.04em;text-transform:uppercase;}
+
+/* ---------- controls ---------- */
+.stButton>button,.stDownloadButton>button{border-radius:8px;font-weight:600;font-size:.87rem;}
+.stDownloadButton>button{width:100%;padding:.6rem;}
+div[data-testid="stFileUploader"] section{border-radius:10px;border-style:dashed;}
 section[data-testid="stSidebar"] [data-testid="stMetric"]{text-align:center;}
-hr{margin:1rem 0;}
+.stCheckbox label p{font-size:.86rem;}
+hr{margin:.9rem 0;}
+
+/* ---------- footnote ---------- */
+.foot{font-size:.75rem;opacity:.5;text-align:center;margin-top:1.6rem;}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
 
 PRESENCE_WINDOW = 30      # තත්පර — මේ ඇතුළත heartbeat ආපු session = online
-PRESENCE_BEAT = 10        # heartbeat interval (5 → 10; websocket traffic අඩුයි)
+PRESENCE_BEAT = 10        # heartbeat interval (websocket traffic අඩුයි)
 MAX_SESSIONS = 500        # registry unbounded වෙලා memory කන එක නවත්වන්න
 BIG_FILE_MB = 20          # මීට වඩා ලොකු file එකකදී warning
-CACHE_TTL = 1800          # තත්පර 30min — cache එකේ output bytes සදාකාලිකව රැඳෙන්නේ නෑ
+CACHE_TTL = 1800          # තත්පර 30min
+TMP_MAX_AGE = 7200        # පැය 2කට වඩා පරණ temp output files අයින්
+
+
+# ----------------------- small UI helpers (version-safe) -----------------------
+
+def step(n, title, hint=""):
+    st.markdown(
+        f'<div class="step"><span class="n">{n}</span><span class="t">{title}</span>'
+        f'<span class="hint">{hint}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def box():
+    """st.container(border=...) පරණ version වල නෑ — safe wrapper."""
+    try:
+        return st.container(border=True)
+    except TypeError:
+        return st.container()
+
+
+def safe_table(rows, column_config=None):
+    """st.column_config පරණ Streamlit වල නෑ — error එකකින් page එක වැටෙන්නේ නෑ."""
+    try:
+        st.dataframe(rows, use_container_width=True, hide_index=True,
+                     column_config=column_config)
+    except Exception:
+        try:
+            st.dataframe(rows, use_container_width=True)
+        except Exception:
+            st.table(rows)
+
+
+def notify(msg):
+    if hasattr(st, "toast"):
+        st.toast(msg)
+    else:
+        st.success(msg)
 
 
 # ----------------------- Online presence (shared across users) -----------------------
@@ -509,11 +579,10 @@ def heartbeat_and_count(window=PRESENCE_WINDOW):
 
 
 def _online_badge_impl():
-    """තත්පර 10කට වරක් rerun වෙලා heartbeat update + count පෙන්නනවා (app එක rerun නොකර)."""
     try:
-        st.metric("🟢 Online users", heartbeat_and_count())
+        st.metric("Online users", heartbeat_and_count())
     except Exception:
-        st.metric("🟢 Online users", "—")
+        st.metric("Online users", "—")
 
 
 # Version-safe: පරණ Streamlit එකක st.fragment නැති නිසා import-time එකේම
@@ -526,16 +595,8 @@ else:
     online_badge = _online_badge_impl
 
 
-def box():
-    """st.container(border=...) පරණ version වල නෑ — safe wrapper."""
-    try:
-        return st.container(border=True)
-    except TypeError:
-        return st.container()
-
-
-# ----------------------- Cached heavy work (speed + shared across users) -----------------------
-# NOTE: cache key එකට digest එක විතරයි (bytes underscore-prefixed → hash වෙන්නේ නෑ).
+# ----------------------- Cached read + disk-backed processing -----------------------
+# cache key එකට digest එක විතරයි (bytes underscore-prefixed → hash වෙන්නේ නෑ).
 # මේකෙන් හැම rerun එකකදීම MB ගණන් bytes hash කරන CPU/RAM spike එක නවතිනවා.
 
 @st.cache_data(show_spinner=False, max_entries=3, ttl=CACHE_TTL)
@@ -552,13 +613,28 @@ def read_sheet_names(digest: str, _file_bytes: bytes):
 
 
 _TMP_DIR = os.path.join(tempfile.gettempdir(), "xl_cleaner")
-os.makedirs(_TMP_DIR, exist_ok=True)
+try:
+    os.makedirs(_TMP_DIR, exist_ok=True)
+except Exception:
+    _TMP_DIR = tempfile.gettempdir()
 
 
 def _drop_temp(path):
     try:
         if path and os.path.exists(path):
             os.remove(path)
+    except Exception:
+        pass
+
+
+def _prune_temp(max_age=TMP_MAX_AGE):
+    """පරණ output files අයින් — disk එක පිරිලා app එක වැටෙන්නේ නෑ."""
+    try:
+        now = time.time()
+        for f in os.listdir(_TMP_DIR):
+            p = os.path.join(_TMP_DIR, f)
+            if os.path.isfile(p) and now - os.path.getmtime(p) > max_age:
+                _drop_temp(p)
     except Exception:
         pass
 
@@ -576,77 +652,90 @@ def run_processing(digest: str, file_bytes: bytes, selected: tuple,
                    multiplier, include_unmarked: bool):
     """Output එක RAM එකේ cache කරන්නේ නෑ — disk temp file එකකට save කරනවා.
 
-    (කලින් version එකේ output bytes cache එකේ රැඳිලා RAM එක පිරෙනවා → container restart.)
-
     Marked sheet එකකට output එකේ:
       - "System <name>"   : faithful TEXT + QUANTITY/Actual Qty scale, original position
       - "Physical <name>" : original sheet එක verbatim (value+format+style), workbook අන්තිමට
     """
+    _prune_temp()
     out_path = os.path.join(_TMP_DIR, f"{digest[:10]}_{uuid.uuid4().hex[:8]}.xlsx")
     return build_output(file_bytes, selected, multiplier, include_unmarked, out_path)
+
+
+def clear_last_result():
+    old = st.session_state.pop("_last_result", None)
+    if old:
+        _drop_temp(old[2])
+    st.session_state.pop("_last_meta", None)
 
 
 # ----------------------------- Sidebar -----------------------------
 
 with st.sidebar:
-    st.markdown("### ⚙️ Status")
+    st.markdown("##### Status")
     online_badge()
     st.divider()
-    st.markdown("**How it works**")
+    st.markdown("##### How it works")
     st.caption(
-        "1. Excel upload කරන්න\n\n"
+        "1. Excel file එක upload කරන්න\n\n"
         "2. Process කරන sheets mark කරන්න\n\n"
         "3. Multiplier (×100 / ×1000) තෝරන්න\n\n"
         "4. Clean Excel download කරන්න"
     )
     st.divider()
+    st.markdown("##### Output structure")
     st.caption(
-        "Marked sheet එකකට **System** (scaled) + **Physical** (original) "
-        "sheet දෙකක් හැදෙනවා.\n\nMulti-user ready · cached for speed."
+        "**System &lt;name&gt;** — text convert + QTY scale\n\n"
+        "**Physical &lt;name&gt;** — original values, styled table\n\n"
+        "Marked sheet එකකට මේ දෙකම හැදෙනවා."
     )
     st.divider()
-    if st.button("🧹 Clear cache / free memory", use_container_width=True):
-        st.cache_data.clear()
-        old = st.session_state.pop("_last_result", None)
-        if old:
-            _drop_temp(old[2])
-        st.session_state.pop("_last_meta", None)
+    if st.button("Clear cache / free memory", use_container_width=True):
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        clear_last_result()
+        _prune_temp(0)
         gc.collect()
-        if hasattr(st, "toast"):
-            st.toast("Cache cleared — memory නිදහස් කළා ✅")
-        else:
-            st.success("Cache cleared — memory නිදහස් කළා ✅")
+        notify("Memory නිදහස් කළා")
 
 
 # ----------------------------- Main -----------------------------
 
 st.markdown(
-    '<div class="app-header"><h1>📊 Excel Cleaner &amp; Quantity Scaler</h1>'
-    '<p>Upload → mark sheets → clean &amp; scale QUANTITY / Actual Qty → download</p></div>',
+    '<div class="masthead">'
+    '<p class="kicker">Warehouse Data Tools</p>'
+    '<h1>Excel Cleaner &amp; Quantity Scaler</h1>'
+    '<p>Upload → sheets mark කරන්න → QUANTITY / Actual Qty clean &amp; scale → download. '
+    'Mark කරන හැම sheet එකකටම System (text) සහ Physical (original) sheet දෙකක් හැදෙනවා.</p>'
+    '</div>',
     unsafe_allow_html=True,
 )
 
 # ---- Step 1: Upload ----
 with box():
-    st.markdown('<div class="step-label">Step 1 · Upload</div>', unsafe_allow_html=True)
+    step(1, "Upload workbook", ".xlsx / .xlsm")
     uploaded = st.file_uploader(
-        "Excel file (.xlsx / .xlsm)", type=["xlsx", "xlsm"], label_visibility="collapsed"
+        "Excel file", type=["xlsx", "xlsm"], label_visibility="collapsed"
     )
 
 if uploaded is None:
     st.info("පටන් ගන්න Excel file එකක් upload කරන්න.")
+    st.markdown('<div class="foot">Multi-user ready · disk-backed output · no data stored</div>',
+                unsafe_allow_html=True)
     st.stop()
 
-file_bytes = uploaded.getvalue()
-digest = hashlib.md5(file_bytes).hexdigest()          # cache key (ලාබයි, එක පාරයි)
-size_mb = len(file_bytes) / (1024 * 1024)
+try:
+    file_bytes = uploaded.getvalue()
+    digest = hashlib.md5(file_bytes).hexdigest()      # cache key (ලාබයි, එක පාරයි)
+    size_mb = len(file_bytes) / (1024 * 1024)
+except Exception as e:
+    st.error(f"File එක කියවන්න බැරි වුණා: {e}")
+    st.stop()
 
 # අලුත් file එකක් නම් පරණ result එක අත්හරිනවා (memory එකේ රැඳෙන්නේ නෑ)
 if st.session_state.get("_last_digest") != digest:
-    _old = st.session_state.pop("_last_result", None)
-    if _old:
-        _drop_temp(_old[2])
-    st.session_state.pop("_last_meta", None)
+    clear_last_result()
     st.session_state["_last_digest"] = digest
     gc.collect()
 
@@ -665,30 +754,40 @@ except Exception as e:
     st.error(f"File එක කියවන්න බැරි වුණා: {e}")
     st.stop()
 
+if not sheet_names:
+    st.error("මේ workbook එකේ sheets නෑ.")
+    st.stop()
+
+
+def skey(i):
+    """Checkbox key එක file එකට bind — අලුත් file එකකට පරණ selection ඇදෙන්නේ නෑ."""
+    return f"sheet_{digest[:8]}_{i}"
+
+
 # ---- Step 2: Sheets ----
 with box():
     h1, h2 = st.columns([3, 1.4])
     with h1:
-        st.markdown('<div class="step-label">Step 2 · Select sheets</div>', unsafe_allow_html=True)
+        step(2, "Select sheets", f"{len(sheet_names)} sheets")
     with h2:
         b1, b2 = st.columns(2)
         if b1.button("All", use_container_width=True):
             for i in range(len(sheet_names)):
-                st.session_state[f"sheet_{i}"] = True
+                st.session_state[skey(i)] = True
         if b2.button("Clear", use_container_width=True):
             for i in range(len(sheet_names)):
-                st.session_state[f"sheet_{i}"] = False
+                st.session_state[skey(i)] = False
 
     selected = []
     cols = st.columns(min(3, len(sheet_names)) or 1)
     for idx, name in enumerate(sheet_names):
         with cols[idx % len(cols)]:
-            if st.checkbox(name, key=f"sheet_{idx}"):
+            if st.checkbox(name, key=skey(idx)):
                 selected.append(name)
 
 # ---- Step 3: Settings ----
 with box():
-    st.markdown('<div class="step-label">Step 3 · Settings</div>', unsafe_allow_html=True)
+    step(3, "Settings")
     sc1, sc2 = st.columns([1, 1.6])
     with sc1:
         mult_choice = st.radio("Multiply QTY by", options=["None", 100, 1000],
@@ -699,17 +798,15 @@ with box():
             "Unmarked sheets ද include කරන්න (clean-only)", value=False
         )
 
-run = st.button("▶️  Process & generate", type="primary", use_container_width=True, disabled=not selected)
+run = st.button("Process & generate", type="primary",
+                use_container_width=True, disabled=not selected)
 if not selected:
     st.caption("අඩුම තරමේ එක sheet එකක්වත් mark කරන්න.")
 
 # ---- Run (error එකකින් app එක crash වෙන්නේ නෑ) ----
 if run and selected:
-    _prev = st.session_state.pop("_last_result", None)
-    if _prev:
-        _drop_temp(_prev[2])
-        _prev = None
-        gc.collect()
+    clear_last_result()
+    gc.collect()
     try:
         with st.spinner("Processing..."):
             result = run_processing(
@@ -730,52 +827,57 @@ if run and selected:
 
 # ---- Results (session_state එකේ තියෙනවා → download click කරාම නැති වෙන්නේ නෑ) ----
 if st.session_state.get("_last_result"):
-    summary, all_warnings, out_path, total_scaled, out_order = st.session_state["_last_result"]
-    meta = st.session_state.get("_last_meta", {})
-    res_mult = meta.get("multiplier")
+    try:
+        summary, all_warnings, out_path, total_scaled, out_order = st.session_state["_last_result"]
+        meta = st.session_state.get("_last_meta", {})
+        res_mult = meta.get("multiplier")
 
-    with box():
-        st.markdown('<div class="step-label">Result</div>', unsafe_allow_html=True)
+        with box():
+            step(4, "Result", f"{len(out_order)} sheets")
 
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Output sheets", len(out_order))
-        m2.metric("Cells scaled" + (f" ×{res_mult}" if res_mult else " (none)"), total_scaled)
-        m3.metric("Warnings", len(all_warnings))
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Output sheets", len(out_order))
+            m2.metric("Cells scaled" + (f" ×{res_mult}" if res_mult else " (none)"), total_scaled)
+            m3.metric("Warnings", len(all_warnings))
 
-        st.dataframe(
-            summary, use_container_width=True, hide_index=True,
-            column_config={
+            safe_table(summary, {
                 "Sheet": st.column_config.TextColumn(width="medium"),
                 "Qty column": st.column_config.TextColumn(width="medium"),
                 "Scaled": st.column_config.NumberColumn(width="small"),
                 "⚠": st.column_config.NumberColumn(width="small"),
-            },
-        )
+            } if hasattr(st, "column_config") else None)
 
-        base = meta.get("name", uploaded.name).rsplit(".", 1)[0]
-        if os.path.exists(out_path):
-            with open(out_path, "rb") as fh:
-                st.download_button(
-                    "⬇️  Download cleaned Excel",
-                    data=fh,
-                    file_name=f"{base}_cleaned.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary",
-                )
-        else:
-            st.warning("Output file එක තව නෑ (app එක restart වෙලා). ආපහු Process කරන්න.")
+            base = meta.get("name", uploaded.name).rsplit(".", 1)[0]
+            try:
+                if os.path.exists(out_path):
+                    with open(out_path, "rb") as fh:
+                        st.download_button(
+                            "Download cleaned Excel",
+                            data=fh,
+                            file_name=f"{base}_cleaned.xlsx",
+                            mime=("application/vnd.openxmlformats-officedocument"
+                                  ".spreadsheetml.sheet"),
+                            type="primary",
+                        )
+                else:
+                    st.warning("Output file එක තව නෑ (app එක restart වෙලා). ආපහු Process කරන්න.")
+            except Exception:
+                st.warning("Output file එක කියවන්න බැරි වුණා. ආපහු Process කරන්න.")
 
-        with st.expander(f"Output sheet order  ·  {len(out_order)} sheets"):
-            st.write("  →  ".join(out_order))
+            with st.expander(f"Output sheet order · {len(out_order)} sheets"):
+                st.write("  →  ".join(out_order))
 
-        if all_warnings:
-            with st.expander(f"⚠️  Warnings ({len(all_warnings)})", expanded=False):
-                st.caption("Scaled value එක decimal, නැත්නම් digit 3ට වඩා වැඩි නැහැ.")
-                st.dataframe(
-                    [{
+            if all_warnings:
+                with st.expander(f"Warnings ({len(all_warnings)})", expanded=False):
+                    st.caption("Scaled value එක decimal, නැත්නම් digit 3ට වඩා වැඩි නැහැ.")
+                    safe_table([{
                         "Sheet": w["sheet"], "Cell": w["cell"], "Header": w["header"],
                         "Original": w["original"], f"×{res_mult}": w["scaled"],
                         "Issue": w["issue"],
-                    } for w in all_warnings],
-                    use_container_width=True, hide_index=True,
-                )
+                    } for w in all_warnings])
+    except Exception as e:
+        st.session_state.pop("_last_result", None)
+        st.error(f"Result එක පෙන්නද්දී error එකක්: {type(e).__name__} — {e}")
+
+st.markdown('<div class="foot">Multi-user ready · disk-backed output · no data stored</div>',
+            unsafe_allow_html=True)
