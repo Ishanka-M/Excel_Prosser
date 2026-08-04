@@ -10,12 +10,11 @@ STABILITY UPDATE v2 (logic 100% same — output Excel එක නොවෙනස�
   * Processing try/except → error එකකින් app crash වෙන්නේ නෑ
   * Presence registry capped + heartbeat 5s → 10s (websocket load අඩුයි)
 
-v3 (UI only) — processing logic byte-for-byte same:
+v4 (UI + multi-user layer) — processing logic byte-for-byte same:
   * Professional UI (masthead, numbered steps, refined metric cards)
-  * st.column_config / dataframe fallback → පරණ Streamlit එකකත් වැටෙන්නේ නෑ
-  * Temp output files auto-prune → disk පිරිලා crash වෙන්නේ නෑ
-  * Checkbox keys file එකට bind → පරණ file එකේ selection ඇදෙන්නේ නෑ
-  * Upload / result render try-except → error එකකින් page එක වැටෙන්නේ නෑ
+  * User management: name, online/busy list, job queue (semaphore)
+  * JSON process log (data/process_log.json) — line counts per run/sheet
+  * Temp files per-user + auto-prune, dataframe fallback, render try-except
 """
 import io
 import os
@@ -451,6 +450,7 @@ def build_output(file_bytes, selected, multiplier, include_unmarked, out_path):
 
 
 # ===================== STREAMLIT APP =====================
+import json
 
 st.set_page_config(page_title="Excel Cleaner & Qty Scaler", page_icon="📊",
                    layout="centered", initial_sidebar_state="expanded")
@@ -512,6 +512,9 @@ MAX_SESSIONS = 500        # registry unbounded වෙලා memory කන එක
 BIG_FILE_MB = 20          # මීට වඩා ලොකු file එකකදී warning
 CACHE_TTL = 1800          # තත්පර 30min
 TMP_MAX_AGE = 7200        # පැය 2කට වඩා පරණ temp output files අයින්
+MAX_CONCURRENT_JOBS = 2   # එකවර process වෙන්න දෙන jobs — RAM එක බේරෙනවා
+QUEUE_WAIT_SEC = 300      # queue එකේ බලාගෙන ඉන්න max තත්පර
+LOG_KEEP_RUNS = 200       # JSON log එකේ තියාගන්න runs ගාණ
 
 
 # ----------------------- small UI helpers (version-safe) -----------------------
@@ -559,30 +562,70 @@ def _presence_registry():
     return {"sessions": {}, "lock": threading.Lock()}
 
 
-def heartbeat_and_count(window=PRESENCE_WINDOW):
+@st.cache_resource
+def _job_registry():
+    """Concurrency control — එකවර process වෙන jobs ගාණ සීමා කරනවා.
+
+    Users 5ක් එකවර ලොකු file process කරොත් RAM ඉවර වෙලා container එක මැරෙනවා.
+    Semaphore එකෙන් එකවර MAX_CONCURRENT_JOBS ගාණක් විතරක් යනවා, ඉතුරු අය queue එකේ.
+    """
+    return {
+        "sem": threading.BoundedSemaphore(MAX_CONCURRENT_JOBS),
+        "active": {},                    # sid -> {"name", "file", "started"}
+        "lock": threading.Lock(),
+        "log_lock": threading.Lock(),
+    }
+
+
+def my_sid():
+    return st.session_state.setdefault("_sid", str(uuid.uuid4()))
+
+
+def my_name():
+    return st.session_state.get("_user_name") or f"User-{my_sid()[:4]}"
+
+
+def heartbeat(window=PRESENCE_WINDOW):
+    """Session එක alive කියලා ලකුණු කරලා, දැන් online අය ලැයිස්තුව දෙනවා."""
     try:
         reg = _presence_registry()
-        sid = st.session_state.setdefault("_sid", str(uuid.uuid4()))
-        now = time.time()
+        jobs = _job_registry()
+        sid, now = my_sid(), time.time()
         with reg["lock"]:
-            reg["sessions"][sid] = now
-            stale = [k for k, v in reg["sessions"].items() if now - v > window]
+            reg["sessions"][sid] = {"t": now, "name": my_name()}
+            stale = [k for k, v in reg["sessions"].items() if now - v["t"] > window]
             for k in stale:
                 reg["sessions"].pop(k, None)
             # safety cap — කවදාවත් unbounded වෙන්නේ නෑ
             if len(reg["sessions"]) > MAX_SESSIONS:
-                for k, _ in sorted(reg["sessions"].items(), key=lambda kv: kv[1])[:-MAX_SESSIONS]:
+                ordered = sorted(reg["sessions"].items(), key=lambda kv: kv[1]["t"])
+                for k, _ in ordered[:-MAX_SESSIONS]:
                     reg["sessions"].pop(k, None)
-            return len(reg["sessions"])
+            people = [(v["name"], k) for k, v in reg["sessions"].items()]
+        with jobs["lock"]:
+            busy = set(jobs["active"].keys())
+        return [{"name": nm, "busy": k in busy, "me": k == sid}
+                for nm, k in sorted(people)]
     except Exception:
-        return 1
+        return [{"name": "—", "busy": False, "me": True}]
 
 
 def _online_badge_impl():
     try:
-        st.metric("Online users", heartbeat_and_count())
+        people = heartbeat()
+        working = sum(1 for p in people if p["busy"])
+        c1, c2 = st.columns(2)
+        c1.metric("Online", len(people))
+        c2.metric("Processing", working)
+        lines = []
+        for p in people[:8]:
+            dot = "🟠" if p["busy"] else "🟢"
+            lines.append(f"{dot} {p['name']}" + (" *(you)*" if p["me"] else ""))
+        if len(people) > 8:
+            lines.append(f"…+{len(people) - 8}")
+        st.caption("\n\n".join(lines))
     except Exception:
-        st.metric("Online users", "—")
+        st.metric("Online", "—")
 
 
 # Version-safe: පරණ Streamlit එකක st.fragment නැති නිසා import-time එකේම
@@ -648,6 +691,115 @@ def _cleanup_temp():
         pass
 
 
+# ----------------------- Line counting + JSON process log -----------------------
+
+@st.cache_data(show_spinner=False, max_entries=6, ttl=CACHE_TTL)
+def count_lines(digest: str, _file_bytes: bytes, sheets: tuple):
+    """Process වෙන sheets වල data lines (හිස් නොවන rows) ගාණ.
+
+    read_only + values_only — වේගවත්, memory අඩු. Output එකට කිසිම බලපෑමක් නෑ.
+    """
+    counts = {}
+    wb = None
+    try:
+        wb = load_workbook(io.BytesIO(_file_bytes), read_only=True,
+                           data_only=True, keep_links=False)
+        for nm in sheets:
+            if nm not in wb.sheetnames:
+                continue
+            n = 0
+            for row in wb[nm].iter_rows(values_only=True):
+                if any(v is not None and str(v).strip() != "" for v in row):
+                    n += 1
+            counts[nm] = n
+    except Exception:
+        pass
+    finally:
+        try:
+            if wb is not None:
+                wb.close()
+        except Exception:
+            pass
+        gc.collect()
+    return counts
+
+
+def _resolve_data_dir():
+    """Log file එක තියෙන තැන — app folder එක write කරන්න බැරි නම් temp එකට."""
+    here = os.path.dirname(os.path.abspath(globals().get("__file__", "."))) or "."
+    for base in (here, tempfile.gettempdir()):
+        try:
+            d = os.path.join(base, "data")
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, ".w")
+            with open(probe, "w") as f:
+                f.write("1")
+            os.remove(probe)
+            return d
+        except Exception:
+            continue
+    return tempfile.gettempdir()
+
+
+_DATA_DIR = _resolve_data_dir()
+LOG_PATH = os.path.join(_DATA_DIR, "process_log.json")
+
+
+def _empty_log():
+    return {"app": "Excel Cleaner & Quantity Scaler", "updated": None,
+            "totals": {"runs": 0, "lines": 0, "sheets": 0, "scaled_cells": 0, "users": 0},
+            "runs": []}
+
+
+def load_log():
+    try:
+        with open(LOG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and "runs" in data:
+            return data
+    except Exception:
+        pass
+    return _empty_log()
+
+
+def save_log(data):
+    """Atomic write — users කීපදෙනෙක් එකවර ලිව්වත් file එක corrupt වෙන්නේ නෑ."""
+    tmp = f"{LOG_PATH}.{uuid.uuid4().hex[:6]}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, LOG_PATH)
+        return True
+    except Exception:
+        _drop_temp(tmp)
+        return False
+
+
+def append_run(record):
+    """Run එකක් log එකට — lock එකක් යටතේ (multi-user safe)."""
+    jobs = _job_registry()
+    try:
+        with jobs["log_lock"]:
+            data = load_log()
+            data["runs"].insert(0, record)
+            del data["runs"][LOG_KEEP_RUNS:]
+            t = {"runs": len(data["runs"]), "lines": 0, "sheets": 0,
+                 "scaled_cells": 0, "users": 0}
+            users = set()
+            for r in data["runs"]:
+                t["lines"] += r.get("total_lines", 0)
+                t["sheets"] += len(r.get("sheets", []))
+                t["scaled_cells"] += r.get("total_scaled", 0)
+                users.add(r.get("user", "?"))
+            t["users"] = len(users)
+            data["totals"] = t
+            data["updated"] = datetime.now().isoformat(timespec="seconds")
+            save_log(data)
+            return data
+    except Exception:
+        return load_log()
+
+
 def run_processing(digest: str, file_bytes: bytes, selected: tuple,
                    multiplier, include_unmarked: bool):
     """Output එක RAM එකේ cache කරන්නේ නෑ — disk temp file එකකට save කරනවා.
@@ -657,7 +809,9 @@ def run_processing(digest: str, file_bytes: bytes, selected: tuple,
       - "Physical <name>" : original sheet එක verbatim (value+format+style), workbook අන්තිමට
     """
     _prune_temp()
-    out_path = os.path.join(_TMP_DIR, f"{digest[:10]}_{uuid.uuid4().hex[:8]}.xlsx")
+    # per-user file name — user දෙන්නෙක් එකවර process කරාම එකිනෙකාගේ output එක overwrite වෙන්නේ නෑ
+    out_path = os.path.join(
+        _TMP_DIR, f"{my_sid()[:6]}_{digest[:8]}_{uuid.uuid4().hex[:6]}.xlsx")
     return build_output(file_bytes, selected, multiplier, include_unmarked, out_path)
 
 
@@ -671,8 +825,14 @@ def clear_last_result():
 # ----------------------------- Sidebar -----------------------------
 
 with st.sidebar:
+    st.markdown("##### Your name")
+    st.text_input("Name", key="_user_name", placeholder=f"User-{my_sid()[:4]}",
+                  label_visibility="collapsed",
+                  help="Process log එකේ සහ online list එකේ පේන නම.")
+    st.divider()
     st.markdown("##### Status")
     online_badge()
+    st.caption(f"එකවර process වෙන්නේ jobs {MAX_CONCURRENT_JOBS}යි — ඉතුරු අය queue එකේ.")
     st.divider()
     st.markdown("##### How it works")
     st.caption(
@@ -804,26 +964,86 @@ if not selected:
     st.caption("අඩුම තරමේ එක sheet එකක්වත් mark කරන්න.")
 
 # ---- Run (error එකකින් app එක crash වෙන්නේ නෑ) ----
+def _set_busy(on, file_name=""):
+    """Online list එකට 🟠 එකයි, queue එකට visibility එකයි."""
+    try:
+        jobs = _job_registry()
+        with jobs["lock"]:
+            if on:
+                jobs["active"][my_sid()] = {"name": my_name(), "file": file_name,
+                                            "started": time.time()}
+            else:
+                jobs["active"].pop(my_sid(), None)
+    except Exception:
+        pass
+
+
 if run and selected:
     clear_last_result()
     gc.collect()
-    try:
-        with st.spinner("Processing..."):
-            result = run_processing(
-                digest, file_bytes, tuple(sorted(selected)), multiplier, include_unmarked
+    jobs = _job_registry()
+    slot = jobs["sem"].acquire(blocking=False)
+    if not slot:
+        with jobs["lock"]:
+            others = ", ".join(v["name"] for v in jobs["active"].values()) or "වෙන user කෙනෙක්"
+        with st.spinner(f"Queue එකේ — දැන් process කරන්නේ: {others}"):
+            slot = jobs["sem"].acquire(timeout=QUEUE_WAIT_SEC)
+
+    if not slot:
+        st.error("Server එක busy — ටික වෙලාවකින් ආපහු try කරන්න.")
+    else:
+        _set_busy(True, uploaded.name)
+        started = time.time()
+        try:
+            with st.spinner("Processing..."):
+                result = run_processing(
+                    digest, file_bytes, tuple(sorted(selected)), multiplier, include_unmarked
+                )
+            lines = count_lines(digest, file_bytes, tuple(sorted(selected)))
+            summary_rows = result[0]
+            scaled_by_sheet = {r["Sheet"]: r.get("Scaled", 0) for r in summary_rows}
+            warn_by_sheet = {r["Sheet"]: r.get("⚠", 0) for r in summary_rows}
+            record = {
+                "run_id": uuid.uuid4().hex[:10],
+                "time": datetime.now().isoformat(timespec="seconds"),
+                "user": my_name(),
+                "session": my_sid()[:8],
+                "file": uploaded.name,
+                "file_mb": round(size_mb, 2),
+                "multiplier": multiplier,
+                "include_unmarked": bool(include_unmarked),
+                "sheets": [
+                    {"name": nm, "lines": lines.get(nm, 0),
+                     "scaled_cells": scaled_by_sheet.get(nm, 0),
+                     "warnings": warn_by_sheet.get(nm, 0)}
+                    for nm in sorted(selected)
+                ],
+                "total_lines": sum(lines.get(nm, 0) for nm in selected),
+                "total_scaled": result[3],
+                "total_warnings": len(result[1]),
+                "output_sheets": len(result[4]),
+                "duration_sec": round(time.time() - started, 2),
+            }
+            append_run(record)
+            st.session_state["_last_result"] = result
+            st.session_state["_last_meta"] = {"name": uploaded.name,
+                                              "multiplier": multiplier,
+                                              "record": record}
+        except MemoryError:
+            st.session_state.pop("_last_result", None)
+            st.error(
+                "Memory මදි වුණා — sheets ගණන අඩු කරලා නැත්නම් file එක කොටස් වලට කඩලා try කරන්න."
             )
-        st.session_state["_last_result"] = result
-        st.session_state["_last_meta"] = {"name": uploaded.name, "multiplier": multiplier}
-    except MemoryError:
-        st.session_state.pop("_last_result", None)
-        st.error(
-            "Memory මදි වුණා — sheets ගණන අඩු කරලා නැත්නම් file එක කොටස් වලට කඩලා try කරන්න."
-        )
-    except Exception as e:
-        st.session_state.pop("_last_result", None)
-        st.error(f"Process කරද්දී error එකක්: {type(e).__name__} — {e}")
-    finally:
-        gc.collect()
+        except Exception as e:
+            st.session_state.pop("_last_result", None)
+            st.error(f"Process කරද්දී error එකක්: {type(e).__name__} — {e}")
+        finally:
+            _set_busy(False)
+            try:
+                jobs["sem"].release()
+            except Exception:
+                pass
+            gc.collect()
 
 # ---- Results (session_state එකේ තියෙනවා → download click කරාම නැති වෙන්නේ නෑ) ----
 if st.session_state.get("_last_result"):
@@ -835,10 +1055,19 @@ if st.session_state.get("_last_result"):
         with box():
             step(4, "Result", f"{len(out_order)} sheets")
 
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Output sheets", len(out_order))
-            m2.metric("Cells scaled" + (f" ×{res_mult}" if res_mult else " (none)"), total_scaled)
-            m3.metric("Warnings", len(all_warnings))
+            rec = meta.get("record", {})
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Lines processed", f"{rec.get('total_lines', 0):,}")
+            m2.metric("Output sheets", len(out_order))
+            m3.metric("Cells scaled" + (f" ×{res_mult}" if res_mult else ""), total_scaled)
+            m4.metric("Warnings", len(all_warnings))
+
+            if rec.get("sheets"):
+                st.caption(
+                    "Lines per sheet — "
+                    + " · ".join(f"{s['name']}: {s['lines']:,}" for s in rec["sheets"])
+                    + f"  ·  {rec.get('duration_sec', 0)}s"
+                )
 
             safe_table(summary, {
                 "Sheet": st.column_config.TextColumn(width="medium"),
@@ -879,5 +1108,51 @@ if st.session_state.get("_last_result"):
         st.session_state.pop("_last_result", None)
         st.error(f"Result එක පෙන්නද්දී error එකක්: {type(e).__name__} — {e}")
 
-st.markdown('<div class="foot">Multi-user ready · disk-backed output · no data stored</div>',
+# ---- Step 5: Process log (JSON) ----
+with box():
+    step(5, "Process log", os.path.basename(LOG_PATH))
+    log_data = load_log()
+    tot = log_data.get("totals", {})
+
+    l1, l2, l3, l4 = st.columns(4)
+    l1.metric("Total runs", f"{tot.get('runs', 0):,}")
+    l2.metric("Total lines", f"{tot.get('lines', 0):,}")
+    l3.metric("Sheets done", f"{tot.get('sheets', 0):,}")
+    l4.metric("Users", f"{tot.get('users', 0):,}")
+
+    runs = log_data.get("runs", [])
+    if runs:
+        safe_table([{
+            "Time": r.get("time", "").replace("T", " "),
+            "User": r.get("user", ""),
+            "File": r.get("file", ""),
+            "Sheets": len(r.get("sheets", [])),
+            "Lines": r.get("total_lines", 0),
+            "Scaled": r.get("total_scaled", 0),
+            "⚠": r.get("total_warnings", 0),
+            "Sec": r.get("duration_sec", 0),
+        } for r in runs[:15]])
+
+        d1, d2 = st.columns([3, 1])
+        with d1:
+            st.download_button(
+                "Download process_log.json",
+                data=json.dumps(log_data, ensure_ascii=False, indent=2).encode("utf-8"),
+                file_name="process_log.json",
+                mime="application/json",
+            )
+        with d2:
+            if st.button("Reset log", use_container_width=True):
+                if st.session_state.get("_confirm_reset"):
+                    save_log(_empty_log())
+                    st.session_state["_confirm_reset"] = False
+                    notify("Log එක reset කළා")
+                    st.rerun()
+                else:
+                    st.session_state["_confirm_reset"] = True
+                    st.warning("ආපහු click කරොත් log එක මකෙනවා.")
+    else:
+        st.caption("තාම runs නෑ — process කරාම මෙතන එනවා.")
+
+st.markdown('<div class="foot">Multi-user ready · disk-backed output · JSON process log</div>',
             unsafe_allow_html=True)
